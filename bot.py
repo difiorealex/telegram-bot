@@ -39,110 +39,89 @@ class Database:
         try:
             self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
             await self.create_tables()
-            logger.info("✅ Database connesso")
+            logger.info("✅ Database connesso e tabelle create")
         except Exception as e:
             logger.error(f"❌ Errore connessione database: {e}")
     
     async def create_tables(self):
-        """Crea le tabelle necessarie"""
+        """Crea automaticamente tutte le tabelle necessarie"""
         async with self.pool.acquire() as conn:
-            # Tabella utenti
+            
+            # 1. Tabella utenti
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
                     username VARCHAR(100),
                     first_name VARCHAR(100),
                     notifications_enabled BOOLEAN DEFAULT true,
-                    categories TEXT[], 
-                    max_price INTEGER DEFAULT 1000,
+                    categories TEXT[] DEFAULT '{}',
+                    max_price INTEGER DEFAULT 500,
+                    min_discount INTEGER DEFAULT 10,
+                    preferred_brands TEXT[] DEFAULT '{}',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_clicks INTEGER DEFAULT 0
                 )
             ''')
             
-            # Tabella prodotti monitorati
+            # 2. Tabella prodotti monitorati
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS watched_products (
                     id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id),
-                    product_name VARCHAR(200),
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    product_name VARCHAR(300),
                     amazon_asin VARCHAR(20),
                     target_price INTEGER,
                     current_price INTEGER,
+                    original_price INTEGER,
                     url TEXT,
+                    image_url TEXT,
+                    last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    price_dropped BOOLEAN DEFAULT false,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Tabella offerte inviate
+            # 3. Tabella offerte inviate (anti-duplicati)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS sent_deals (
                     id SERIAL PRIMARY KEY,
                     deal_hash VARCHAR(100) UNIQUE,
-                    title VARCHAR(200),
-                    price VARCHAR(20),
+                    title VARCHAR(300),
+                    price VARCHAR(50),
+                    original_price VARCHAR(50),
+                    discount_percent INTEGER,
                     url TEXT,
+                    image_url TEXT,
+                    sent_to_channel BOOLEAN DEFAULT false,
+                    sent_to_users INTEGER DEFAULT 0,
+                    clicks INTEGER DEFAULT 0,
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-    
-    async def add_user(self, user_id: int, username: str, first_name: str):
-        """Aggiunge o aggiorna un utente"""
-        async with self.pool.acquire() as conn:
+            
+            # 4. Tabella statistiche
             await conn.execute('''
-                INSERT INTO users (user_id, username, first_name, last_activity)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-                ON CONFLICT (user_id) 
-                DO UPDATE SET last_activity = CURRENT_TIMESTAMP
-            ''', user_id, username, first_name)
-    
-    async def get_all_users(self) -> List[Dict]:
-        """Ottiene tutti gli utenti attivi"""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch('''
-                SELECT user_id, notifications_enabled, categories, max_price 
-                FROM users 
-                WHERE notifications_enabled = true
-                AND last_activity > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                CREATE TABLE IF NOT EXISTS bot_stats (
+                    id SERIAL PRIMARY KEY,
+                    date DATE DEFAULT CURRENT_DATE,
+                    total_users INTEGER DEFAULT 0,
+                    active_users INTEGER DEFAULT 0,
+                    deals_sent INTEGER DEFAULT 0,
+                    channel_messages INTEGER DEFAULT 0,
+                    total_clicks INTEGER DEFAULT 0,
+                    revenue_estimate DECIMAL(10,2) DEFAULT 0.00
+                )
             ''')
-            return [dict(row) for row in rows]
-    
-    async def update_user_preferences(self, user_id: int, notifications: bool = None, 
-                                    categories: List[str] = None, max_price: int = None):
-        """Aggiorna preferenze utente"""
-        async with self.pool.acquire() as conn:
-            if notifications is not None:
-                await conn.execute(
-                    'UPDATE users SET notifications_enabled = $1 WHERE user_id = $2',
-                    notifications, user_id
-                )
-            if categories is not None:
-                await conn.execute(
-                    'UPDATE users SET categories = $1 WHERE user_id = $2',
-                    categories, user_id
-                )
-            if max_price is not None:
-                await conn.execute(
-                    'UPDATE users SET max_price = $1 WHERE user_id = $2',
-                    max_price, user_id
-                )
-    
-    async def is_deal_sent(self, deal_hash: str) -> bool:
-        """Controlla se un'offerta è già stata inviata"""
-        async with self.pool.acquire() as conn:
-            result = await conn.fetchval(
-                'SELECT COUNT(*) FROM sent_deals WHERE deal_hash = $1',
-                deal_hash
-            )
-            return result > 0
-    
-    async def mark_deal_sent(self, deal_hash: str, title: str, price: str, url: str):
-        """Segna un'offerta come inviata"""
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO sent_deals (deal_hash, title, price, url)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (deal_hash) DO NOTHING
+            
+            # 5. Crea indici per performance
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_notifications ON users(notifications_enabled)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_activity ON users(last_activity)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_deals_hash ON sent_deals(deal_hash)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_deals_sent_at ON sent_deals(sent_at)')
+            
+            logger.info("✅ Tutte le tabelle create con successo")
+
             ''', deal_hash, title, price, url)
 
 class AmazonScraperAdvanced:
@@ -682,3 +661,4 @@ async def main():
         logger.error("Database non disponibile - alcune funzioni saranno limitate")
     
     # Continua con l'avvio normale...
+
