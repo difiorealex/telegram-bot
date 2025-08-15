@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 AMAZON_TAG = os.getenv('AMAZON_TAG', 'botaffari-21')
 DATABASE_URL = os.getenv('DATABASE_URL')  # PostgreSQL URL da Render
-CHANNEL_ID = os.getenv('CHANNEL_ID')  # ID del canale Telegram
+CHANNEL_ID = os.getenv('121413748')  # ID del canale Telegram
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN non trovato!")
@@ -654,3 +654,31 @@ def main():
 if __name__ == '__main__':
     main()
 
+async def test_database():
+    """Testa la connessione al database"""
+    try:
+        if not DATABASE_URL:
+            logger.error("❌ DATABASE_URL non configurato")
+            return False
+            
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
+        
+        async with pool.acquire() as conn:
+            result = await conn.fetchval('SELECT version()')
+            logger.info(f"✅ Database connesso: {result[:50]}...")
+            
+        await pool.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Errore connessione database: {e}")
+        return False
+
+# Chiamala in main() prima di avviare il bot
+async def main():
+    # Test database
+    db_ok = await test_database()
+    if not db_ok:
+        logger.error("Database non disponibile - alcune funzioni saranno limitate")
+    
+    # Continua con l'avvio normale...
