@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Configurazione
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-AMAZON_TAG = os.getenv('AMAZON_TAG', 'tuotag-21')
+AMAZON_TAG = os.getenv('AMAZON_TAG', 'botaffari-21')
 DATABASE_URL = os.getenv('DATABASE_URL')  # PostgreSQL URL da Render
 CHANNEL_ID = os.getenv('CHANNEL_ID')  # ID del canale Telegram
 
@@ -653,3 +653,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
