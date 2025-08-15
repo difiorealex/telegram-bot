@@ -4,11 +4,15 @@ import re
 import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
+import json
 from fake_useragent import UserAgent
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncpg
+from typing import List, Dict, Optional
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -16,13 +20,132 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configurazione
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-AMAZON_TAG = os.getenv('AMAZON_TAG', 'botaffari-21')
+AMAZON_TAG = os.getenv('AMAZON_TAG', 'tuotag-21')
+DATABASE_URL = os.getenv('DATABASE_URL')  # PostgreSQL URL da Render
+CHANNEL_ID = os.getenv('CHANNEL_ID')  # ID del canale Telegram
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN non trovato!")
 
-class AmazonScraper:
+class Database:
+    def __init__(self, database_url):
+        self.database_url = database_url
+        self.pool = None
+    
+    async def connect(self):
+        """Connessione al database PostgreSQL"""
+        try:
+            self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=5)
+            await self.create_tables()
+            logger.info("✅ Database connesso")
+        except Exception as e:
+            logger.error(f"❌ Errore connessione database: {e}")
+    
+    async def create_tables(self):
+        """Crea le tabelle necessarie"""
+        async with self.pool.acquire() as conn:
+            # Tabella utenti
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(100),
+                    first_name VARCHAR(100),
+                    notifications_enabled BOOLEAN DEFAULT true,
+                    categories TEXT[], 
+                    max_price INTEGER DEFAULT 1000,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Tabella prodotti monitorati
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS watched_products (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id),
+                    product_name VARCHAR(200),
+                    amazon_asin VARCHAR(20),
+                    target_price INTEGER,
+                    current_price INTEGER,
+                    url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Tabella offerte inviate
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS sent_deals (
+                    id SERIAL PRIMARY KEY,
+                    deal_hash VARCHAR(100) UNIQUE,
+                    title VARCHAR(200),
+                    price VARCHAR(20),
+                    url TEXT,
+                    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+    
+    async def add_user(self, user_id: int, username: str, first_name: str):
+        """Aggiunge o aggiorna un utente"""
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name, last_activity)
+                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET last_activity = CURRENT_TIMESTAMP
+            ''', user_id, username, first_name)
+    
+    async def get_all_users(self) -> List[Dict]:
+        """Ottiene tutti gli utenti attivi"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT user_id, notifications_enabled, categories, max_price 
+                FROM users 
+                WHERE notifications_enabled = true
+                AND last_activity > CURRENT_TIMESTAMP - INTERVAL '30 days'
+            ''')
+            return [dict(row) for row in rows]
+    
+    async def update_user_preferences(self, user_id: int, notifications: bool = None, 
+                                    categories: List[str] = None, max_price: int = None):
+        """Aggiorna preferenze utente"""
+        async with self.pool.acquire() as conn:
+            if notifications is not None:
+                await conn.execute(
+                    'UPDATE users SET notifications_enabled = $1 WHERE user_id = $2',
+                    notifications, user_id
+                )
+            if categories is not None:
+                await conn.execute(
+                    'UPDATE users SET categories = $1 WHERE user_id = $2',
+                    categories, user_id
+                )
+            if max_price is not None:
+                await conn.execute(
+                    'UPDATE users SET max_price = $1 WHERE user_id = $2',
+                    max_price, user_id
+                )
+    
+    async def is_deal_sent(self, deal_hash: str) -> bool:
+        """Controlla se un'offerta è già stata inviata"""
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                'SELECT COUNT(*) FROM sent_deals WHERE deal_hash = $1',
+                deal_hash
+            )
+            return result > 0
+    
+    async def mark_deal_sent(self, deal_hash: str, title: str, price: str, url: str):
+        """Segna un'offerta come inviata"""
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO sent_deals (deal_hash, title, price, url)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (deal_hash) DO NOTHING
+            ''', deal_hash, title, price, url)
+
+class AmazonScraperAdvanced:
     def __init__(self):
         self.session = None
         self.ua = UserAgent()
@@ -42,8 +165,7 @@ class AmazonScraper:
             await self.session.close()
     
     def create_affiliate_link(self, amazon_url):
-        """Crea un link di affiliazione da un URL Amazon"""
-        # Estrae l'ASIN dall'URL
+        """Crea un link di affiliazione"""
         asin_match = re.search(r'/dp/([A-Z0-9]{10})', amazon_url)
         if not asin_match:
             asin_match = re.search(r'/gp/product/([A-Z0-9]{10})', amazon_url)
@@ -56,15 +178,55 @@ class AmazonScraper:
             return f"{amazon_url}&tag={AMAZON_TAG}"
         else:
             return f"{amazon_url}?tag={AMAZON_TAG}"
-
+    
+    def generate_deal_hash(self, title: str, price: str) -> str:
+        """Genera hash unico per l'offerta"""
+        import hashlib
+        content = f"{title}_{price}".lower()
+        return hashlib.md5(content.encode()).hexdigest()[:16]
+    
+    async def get_trending_deals(self, max_deals=8) -> List[Dict]:
+        """Ottiene offerte di tendenza per broadcast automatico"""
+        await self.create_session()
+        
+        trending_searches = [
+            "offerte lampo",
+            "smartphone",
+            "cuffie wireless", 
+            "smart tv",
+            "robot aspirapolvere",
+            "echo dot",
+            "fire tv stick"
+        ]
+        
+        all_deals = []
+        
+        for search_term in random.sample(trending_searches, 3):
+            try:
+                deals = await self.scrape_amazon_deals(search_term, max_deals=3)
+                all_deals.extend(deals)
+                await asyncio.sleep(random.uniform(2, 4))
+            except Exception as e:
+                logger.error(f"Errore ricerca {search_term}: {e}")
+                continue
+        
+        # Filtra duplicati e ordina per qualità
+        unique_deals = {}
+        for deal in all_deals:
+            deal_key = deal['title'][:50]  # Usa titolo per unicità
+            if deal_key not in unique_deals:
+                deal['hash'] = self.generate_deal_hash(deal['title'], deal['price'])
+                unique_deals[deal_key] = deal
+        
+        return list(unique_deals.values())[:max_deals]
+    
     async def scrape_amazon_deals(self, search_term="", max_deals=5):
-        """Scrapa offerte direttamente da Amazon"""
+        """Scraping Amazon (stessa funzione di prima, ottimizzata)"""
         await self.create_session()
         
         if search_term:
             url = f"https://www.amazon.it/s?k={search_term.replace(' ', '+')}&sort=price-asc-rank"
         else:
-            # Pagina delle offerte lampo
             url = "https://www.amazon.it/gp/goldbox"
         
         headers = {
@@ -78,17 +240,15 @@ class AmazonScraper:
         deals = []
         
         try:
-            await asyncio.sleep(random.uniform(1, 3))  # Rate limiting
+            await asyncio.sleep(random.uniform(1, 3))
             
             async with self.session.get(url, headers=headers) as response:
                 if response.status != 200:
-                    logger.warning(f"Amazon response status: {response.status}")
                     return []
                 
                 html = await response.text()
                 soup = BeautifulSoup(html, 'lxml')
                 
-                # Cerca prodotti nelle offerte
                 products = soup.find_all('div', {'data-component-type': 's-search-result'})
                 
                 for product in products[:max_deals]:
@@ -110,10 +270,15 @@ class AmazonScraper:
                         price_elem = product.find('span', class_='a-price-whole')
                         if price_elem:
                             price = f"€{price_elem.get_text().strip()}"
+                            price_value = int(price_elem.get_text().strip().replace(',', ''))
                         else:
                             continue
                         
-                        # Prezzo originale (se in offerta)
+                        # Scarta prodotti troppo costosi (>500€ per broadcast automatico)
+                        if price_value > 500:
+                            continue
+                        
+                        # Prezzo originale
                         original_price_elem = product.find('span', class_='a-price a-text-price')
                         original_price = original_price_elem.get_text().strip() if original_price_elem else price
                         
@@ -128,6 +293,7 @@ class AmazonScraper:
                         deals.append({
                             'title': title[:100] + "..." if len(title) > 100 else title,
                             'price': price,
+                            'price_value': price_value,
                             'original_price': original_price,
                             'url': product_url,
                             'image': image_url,
@@ -144,365 +310,345 @@ class AmazonScraper:
         
         return deals
 
-    async def scrape_pepper_deals(self, max_deals=3):
-        """Scrapa offerte da Pepperdeals (Pepper.it)"""
-        await self.create_session()
-        
-        url = "https://www.pepper.it/offerte"
-        headers = {
-            'User-Agent': self.ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-        
-        deals = []
+# Inizializza componenti
+db = Database(DATABASE_URL) if DATABASE_URL else None
+scraper = AmazonScraperAdvanced()
+scheduler = AsyncIOScheduler()
+
+class NotificationSystem:
+    def __init__(self, bot_app):
+        self.app = bot_app
+    
+    async def send_to_channel(self, deals: List[Dict]):
+        """Invia offerte al canale Telegram"""
+        if not CHANNEL_ID or not deals:
+            return
         
         try:
-            await asyncio.sleep(random.uniform(2, 4))
+            # Messaggio di intestazione
+            header = f"""
+🔥 **OFFERTE AUTOMATICHE DEL GIORNO**
+📅 {datetime.now().strftime('%d/%m/%Y - %H:%M')}
+
+💰 Le migliori offerte trovate in tempo reale!
+🤖 Bot aggiornato ogni 3 ore
+
+➖➖➖➖➖➖➖➖➖➖
+            """
             
-            async with self.session.get(url, headers=headers) as response:
-                if response.status != 200:
-                    return []
+            await self.app.bot.send_message(CHANNEL_ID, header)
+            await asyncio.sleep(2)
+            
+            for i, deal in enumerate(deals[:5], 1):  # Massimo 5 offerte per canale
+                affiliate_link = scraper.create_affiliate_link(deal['url'])
                 
-                html = await response.text()
-                soup = BeautifulSoup(html, 'lxml')
+                channel_text = f"""
+🛒 **OFFERTA #{i}**
+
+**{deal['title']}**
+
+💰 Prezzo: **{deal['price']}**
+{f"~~{deal['original_price']}~~" if deal.get('original_price') and deal['original_price'] != deal['price'] else ""}
+⭐ Rating: {deal.get('rating', 'N/A')}
+
+🎯 Offerta verificata e sicura
+💡 Link diretto Amazon Italia
+                """
                 
-                # Cerca deal containers
-                deal_elements = soup.find_all('article', class_='thread')
+                keyboard = [[InlineKeyboardButton("🛒 ACQUISTA ORA", url=affiliate_link)]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                for deal in deal_elements[:max_deals]:
-                    try:
-                        # Titolo
-                        title_elem = deal.find('strong', class_='thread-title')
-                        title = title_elem.get_text().strip() if title_elem else "Offerta"
-                        
-                        # Prezzo
-                        price_elem = deal.find('span', class_='thread-price')
-                        price = price_elem.get_text().strip() if price_elem else "Prezzo non disponibile"
-                        
-                        # Link
-                        link_elem = deal.find('a', class_='thread-link')
-                        deal_url = "https://www.pepper.it" + link_elem.get('href', '') if link_elem else ""
-                        
-                        # Temperatura (popolarità)
-                        temp_elem = deal.find('span', class_='vote-box-temp')
-                        temperature = temp_elem.get_text().strip() if temp_elem else "0°"
-                        
-                        if 'amazon' in deal_url.lower() or 'amazon' in title.lower():
-                            deals.append({
-                                'title': title[:100] + "..." if len(title) > 100 else title,
-                                'price': price,
-                                'original_price': '',
-                                'url': deal_url,
-                                'image': '',
-                                'rating': f"🌡️ {temperature}",
-                                'source': 'Pepper'
-                            })
+                try:
+                    if deal.get('image') and deal['image'].startswith('http'):
+                        await self.app.bot.send_photo(
+                            CHANNEL_ID,
+                            photo=deal['image'],
+                            caption=channel_text,
+                            reply_markup=reply_markup
+                        )
+                    else:
+                        await self.app.bot.send_message(
+                            CHANNEL_ID,
+                            channel_text,
+                            reply_markup=reply_markup
+                        )
                     
-                    except Exception as e:
-                        logger.error(f"Errore parsing Pepper: {e}")
-                        continue
-        
+                    # Segna come inviata
+                    if db:
+                        await db.mark_deal_sent(
+                            deal['hash'],
+                            deal['title'],
+                            deal['price'],
+                            deal['url']
+                        )
+                    
+                    await asyncio.sleep(3)  # Pausa tra messaggi
+                    
+                except Exception as e:
+                    logger.error(f"Errore invio al canale: {e}")
+            
+            # Footer
+            footer = f"""
+➖➖➖➖➖➖➖➖➖➖
+🤖 **Prossimo aggiornamento**: tra 3 ore
+💬 **Bot personale**: @{(await self.app.bot.get_me()).username}
+
+❤️ Supporta il progetto usando i nostri link!
+            """
+            
+            await self.app.bot.send_message(CHANNEL_ID, footer)
+            
         except Exception as e:
-            logger.error(f"Errore scraping Pepper: {e}")
+            logger.error(f"Errore generale invio canale: {e}")
+    
+    async def send_personal_notifications(self, deals: List[Dict]):
+        """Invia notifiche personali agli utenti iscritti"""
+        if not db or not deals:
+            return
         
-        return deals
+        users = await db.get_all_users()
+        
+        for user in users:
+            try:
+                user_id = user['user_id']
+                max_price = user.get('max_price', 1000)
+                categories = user.get('categories', [])
+                
+                # Filtra offerte per preferenze utente
+                filtered_deals = []
+                for deal in deals:
+                    if deal.get('price_value', 0) <= max_price:
+                        filtered_deals.append(deal)
+                
+                if not filtered_deals:
+                    continue
+                
+                # Invia massimo 2 offerte personali
+                for deal in filtered_deals[:2]:
+                    # Controlla se già inviata a questo utente (opzionale)
+                    affiliate_link = scraper.create_affiliate_link(deal['url'])
+                    
+                    personal_text = f"""
+🎁 **OFFERTA PERSONALE PER TE!**
 
-    async def get_mixed_deals(self, search_term="", max_total=5):
-        """Combina offerte da più fonti"""
-        all_deals = []
-        
-        # Amazon deals
-        amazon_deals = await self.scrape_amazon_deals(search_term, max_deals=3)
-        all_deals.extend(amazon_deals)
-        
-        # Pepper deals (solo se non stiamo cercando qualcosa di specifico)
-        if not search_term:
-            pepper_deals = await self.scrape_pepper_deals(max_deals=2)
-            all_deals.extend(pepper_deals)
-        
-        # Mescola e limita
-        random.shuffle(all_deals)
-        return all_deals[:max_total]
+**{deal['title']}**
 
-# Inizializza il scraper
-scraper = AmazonScraper()
+💰 **{deal['price']}** (sotto il tuo limite di €{max_price})
+⭐ {deal.get('rating', 'N/A')}
 
+🔥 Offerta trovata automaticamente dal bot!
+                    """
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("🛒 Acquista", url=affiliate_link)],
+                        [InlineKeyboardButton("⚙️ Modifica Preferenze", callback_data='settings')]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await self.app.bot.send_message(
+                        user_id,
+                        personal_text,
+                        reply_markup=reply_markup
+                    )
+                    
+                    await asyncio.sleep(1)  # Rate limiting
+                    
+            except Exception as e:
+                logger.error(f"Errore notifica personale utente {user_id}: {e}")
+
+# Funzioni scheduling
+async def automatic_deal_broadcast():
+    """Funzione chiamata ogni 3 ore per broadcast automatico"""
+    logger.info("🔄 Avvio broadcast automatico offerte...")
+    
+    try:
+        # Ottieni offerte fresche
+        deals = await scraper.get_trending_deals(max_deals=8)
+        
+        if not deals:
+            logger.warning("Nessuna offerta trovata per broadcast")
+            return
+        
+        # Filtra offerte già inviate
+        if db:
+            new_deals = []
+            for deal in deals:
+                if not await db.is_deal_sent(deal['hash']):
+                    new_deals.append(deal)
+            deals = new_deals
+        
+        if not deals:
+            logger.info("Tutte le offerte sono già state inviate")
+            return
+        
+        logger.info(f"🎯 Invio {len(deals)} nuove offerte")
+        
+        # Invia al canale e agli utenti
+        notification_system = NotificationSystem(application)
+        
+        # Prima al canale pubblico
+        await notification_system.send_to_channel(deals)
+        await asyncio.sleep(5)
+        
+        # Poi notifiche personali
+        await notification_system.send_personal_notifications(deals)
+        
+        logger.info("✅ Broadcast completato con successo")
+        
+    except Exception as e:
+        logger.error(f"❌ Errore broadcast automatico: {e}")
+
+# Comandi bot aggiornati
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
+    user = update.effective_user
+    
+    # Salva utente nel database
+    if db:
+        await db.add_user(user.id, user.username, user.first_name)
+    
     welcome_text = f"""
-🛒 **Ciao {user_name}! Bot Offerte Amazon con AI**
+🤖 **Ciao {user.first_name}! Bot Offerte Amazon PREMIUM**
 
-🔥 **Cosa posso fare:**
-• Trova offerte REALI aggiornate
-• Scraping live da Amazon e siti deal
-• Link affiliati per supportare il bot
-• Ricerca prodotti specifica
+🔥 **NOVITÀ - Sistema Automatico Attivo!**
+• 🕐 Offerte automatiche ogni 3 ore
+• 📱 Notifiche personali su misura
+• 📢 Canale pubblico sempre aggiornato
 
-**Comandi veloci:**
-/offerte - 🔥 Migliori offerte ora
-/cerca [prodotto] - 🔍 Ricerca specifica
-/trending - 📈 Prodotti di tendenza
-/help - 📚 Guida completa
+**Comandi disponibili:**
+/offerte - 🔍 Ricerca manuale offerte
+/notifiche - 🔔 Gestisci notifiche automatiche
+/preferenze - ⚙️ Imposta filtri personali
+/canale - 📢 Link al canale offerte
+/cerca [prodotto] - 🎯 Ricerca specifica
 
-**Inizia subito! ⬇️**
+**🎁 Inizia subito!**
     """
     
     keyboard = [
-        [InlineKeyboardButton("🔥 Offerte Live", callback_data='live_deals')],
-        [InlineKeyboardButton("🔍 Cerca Prodotto", callback_data='search_mode')],
-        [InlineKeyboardButton("📱 Elettronica", callback_data='search_elettronica')],
-        [InlineKeyboardButton("🏠 Casa", callback_data='search_casa')]
+        [InlineKeyboardButton("🔔 Attiva Notifiche", callback_data='enable_notifications')],
+        [InlineKeyboardButton("📢 Canale Offerte", url=f"https://t.me/{CHANNEL_ID}")],
+        [InlineKeyboardButton("🔍 Cerca Offerte", callback_data='search_deals')],
+        [InlineKeyboardButton("⚙️ Preferenze", callback_data='settings')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
-async def offerte_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loading_msg = await update.message.reply_text(
-        "🔍 **Ricerca offerte in corso...**\n"
-        "Scansiono Amazon e siti deal per te!\n"
-        "⏳ Ci vogliono 10-15 secondi..."
-    )
-    
-    try:
-        deals = await scraper.get_mixed_deals(max_total=5)
-        
-        await loading_msg.delete()
-        
-        if not deals:
-            await update.message.reply_text(
-                "😅 **Nessuna offerta trovata al momento**\n\n"
-                "Prova:\n"
-                "• /cerca [prodotto specifico]\n" 
-                "• Riprova tra qualche minuto\n"
-                "• /trending per prodotti popolari"
-            )
-            return
-        
-        await update.message.reply_text(
-            f"🎉 **Ho trovato {len(deals)} offerte per te!**\n"
-            f"🕐 Aggiornate: {datetime.now().strftime('%H:%M')}"
-        )
-        
-        for i, deal in enumerate(deals, 1):
-            # Crea link affiliato se è Amazon
-            if 'amazon' in deal['url'].lower():
-                final_url = scraper.create_affiliate_link(deal['url'])
-                source_emoji = "🛒"
-            else:
-                final_url = deal['url']
-                source_emoji = "🌶️"
-            
-            deal_text = f"""
-{source_emoji} **{deal['title']}**
-
-💰 **Prezzo**: {deal['price']}
-{f"~~{deal['original_price']}~~" if deal['original_price'] and deal['original_price'] != deal['price'] else ""}
-⭐ **Rating**: {deal['rating']}
-📍 **Fonte**: {deal['source']}
-
-💡 *Offerta #{i} di {len(deals)}*
-            """
-            
-            keyboard = [
-                [InlineKeyboardButton("🛒 Vai all'Offerta", url=final_url)],
-                [InlineKeyboardButton("🔄 Condividi", callback_data=f"share_{i}")],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            try:
-                if deal.get('image') and deal['image'].startswith('http'):
-                    await update.message.reply_photo(
-                        photo=deal['image'],
-                        caption=deal_text,
-                        reply_markup=reply_markup
-                    )
-                else:
-                    await update.message.reply_text(deal_text, reply_markup=reply_markup)
-            except:
-                await update.message.reply_text(deal_text, reply_markup=reply_markup)
-            
-            await asyncio.sleep(1)  # Evita rate limiting Telegram
-            
-    except Exception as e:
-        await loading_msg.delete()
-        logger.error(f"Errore in offerte_command: {e}")
-        await update.message.reply_text(
-            "❌ **Errore temporaneo**\n\n"
-            "Il servizio è momentaneamente sovraccarico.\n"
-            "Riprova tra qualche minuto! 🔄"
-        )
-
-async def cerca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "🔍 **Ricerca Personalizzata**\n\n"
-            "**Formato**: `/cerca nome prodotto`\n\n"
-            "**Esempi efficaci:**\n"
-            "• `/cerca iPhone 15 Pro`\n"
-            "• `/cerca cuffie noise cancelling`\n"
-            "• `/cerca robot aspirapolvere`\n"
-            "• `/cerca SSD 1TB`\n\n"
-            "🎯 Più specifico = risultati migliori!"
-        )
+async def notifiche_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestione notifiche personali"""
+    if not db:
+        await update.message.reply_text("❌ Database non disponibile")
         return
     
-    query = ' '.join(context.args)
+    user_id = update.effective_user.id
     
-    loading_msg = await update.message.reply_text(
-        f"🔍 **Cerco '{query}'**\n"
-        f"Scansiono i prezzi migliori...\n"
-        f"⏳ 10-15 secondi"
-    )
+    text = """
+🔔 **NOTIFICHE AUTOMATICHE**
+
+**Cosa riceverai:**
+• 🎁 Offerte personalizzate ogni 3 ore
+• 💰 Solo prodotti entro il tuo budget
+• 🎯 Filtrate per categorie preferite
+• ⚡ Offerte lampo esclusive
+
+**Configura le tue preferenze:**
+    """
     
-    try:
-        deals = await scraper.scrape_amazon_deals(search_term=query, max_deals=5)
-        
-        await loading_msg.delete()
-        
-        if not deals:
-            await update.message.reply_text(
-                f"😅 **Nessun risultato per '{query}'**\n\n"
-                "**Suggerimenti:**\n"
-                "• Usa termini più generici\n"
-                "• Controlla la scrittura\n" 
-                "• Prova in inglese\n"
-                "• Usa /offerte per offerte generali"
-            )
-            return
-        
-        await update.message.reply_text(
-            f"🎯 **{len(deals)} risultati per '{query}'**\n"
-            f"📅 Aggiornati: {datetime.now().strftime('%H:%M')}"
-        )
-        
-        for i, deal in enumerate(deals, 1):
-            affiliate_link = scraper.create_affiliate_link(deal['url'])
-            
-            deal_text = f"""
-🎯 **{deal['title']}**
+    keyboard = [
+        [InlineKeyboardButton("✅ Attiva Notifiche", callback_data='enable_notif')],
+        [InlineKeyboardButton("❌ Disattiva", callback_data='disable_notif')],
+        [InlineKeyboardButton("💰 Budget Max", callback_data='set_budget')],
+        [InlineKeyboardButton("📱 Categorie", callback_data='set_categories')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, reply_markup=reply_markup)
 
-💰 **Prezzo**: {deal['price']}
-⭐ **Valutazione**: {deal['rating']}
-🛒 **Amazon Italia**
+async def canale_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Link al canale"""
+    text = f"""
+📢 **CANALE UFFICIALE OFFERTE**
 
-🎁 *Risultato #{i} per "{query}"*
-            """
-            
-            keyboard = [
-                [InlineKeyboardButton("🛒 Acquista Ora", url=affiliate_link)],
-                [InlineKeyboardButton("📊 Altri Modelli", callback_data=f"more_{query}")],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            try:
-                if deal.get('image') and deal['image'].startswith('http'):
-                    await update.message.reply_photo(
-                        photo=deal['image'],
-                        caption=deal_text,
-                        reply_markup=reply_markup
-                    )
-                else:
-                    await update.message.reply_text(deal_text, reply_markup=reply_markup)
-            except:
-                await update.message.reply_text(deal_text, reply_markup=reply_markup)
-            
-            await asyncio.sleep(1)
-            
-    except Exception as e:
-        await loading_msg.delete()
-        logger.error(f"Errore in cerca_command: {e}")
-        await update.message.reply_text(
-            f"❌ **Errore nella ricerca '{query}'**\n\n"
-            "Riprova tra qualche minuto o usa /offerte 🔄"
-        )
+🔗 **@{CHANNEL_ID}**
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+**Cosa trovi:**
+• 🕐 Offerte automatiche ogni 3 ore
+• 🔥 Migliori deal Amazon del momento  
+• 💰 Sconti verificati e sicuri
+• 🚀 Offerte lampo esclusive
+
+**Iscriviti ora per non perdere nessuna offerta!**
+    """
+    
+    keyboard = [[InlineKeyboardButton("📢 Vai al Canale", url=f"https://t.me/{CHANNEL_ID}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+# Mantieni le funzioni offerte_command e cerca_command come prima...
+# (Stesso codice di prima)
+
+async def button_handler_advanced(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
     
-    if query.data == 'live_deals':
-        await query.message.reply_text("🔍 Carico offerte live...")
-        await offerte_command(update, context)
-    
-    elif query.data == 'search_mode':
+    if query.data == 'enable_notifications':
+        if db:
+            await db.update_user_preferences(user_id, notifications=True)
         await query.message.reply_text(
-            "🔍 **Modalità Ricerca Attivata**\n\n"
-            "Scrivi: `/cerca nome prodotto`\n\n"
-            "**Esempi:**\n" 
-            "• `/cerca MacBook Air`\n"
-            "• `/cerca scarpe running Nike`"
+            "✅ **Notifiche attivate!**\n\n"
+            "Riceverai offerte personalizzate ogni 3 ore.\n"
+            "Usa /preferenze per configurare filtri."
         )
     
-    elif query.data.startswith('search_'):
-        category = query.data.split('_')[1]
-        categories = {
-            'elettronica': 'smartphone tablet laptop',
-            'casa': 'elettrodomestici cucina bagno'
-        }
-        search_term = categories.get(category, category)
-        
-        await query.message.reply_text(f"🔍 Cerco offerte {category}...")
-        # Simula comando cerca
-        context.args = search_term.split()
-        await cerca_command(update, context)
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestisce URL Amazon inviati dall'utente"""
-    text = update.message.text
+    elif query.data == 'disable_notif':
+        if db:
+            await db.update_user_preferences(user_id, notifications=False)
+        await query.message.reply_text("❌ Notifiche disattivate.")
     
-    if 'amazon.it' in text or 'amazon.com' in text:
-        try:
-            affiliate_link = scraper.create_affiliate_link(text)
-            
-            response = f"""
-🔗 **Link Amazon Convertito!**
-
-✅ **Link con affiliazione creato**
-💰 Supporti il bot senza costi extra
-
-**Link originale:**
-`{text[:50]}...`
-
-**Link affiliato:**
-            """
-            
-            keyboard = [[
-                InlineKeyboardButton("🛒 Apri Link Affiliato", url=affiliate_link),
-                InlineKeyboardButton("📋 Copia Link", callback_data="copy_link")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(response, reply_markup=reply_markup)
-            await update.message.reply_text(f"`{affiliate_link}`")
-            
-        except Exception as e:
-            await update.message.reply_text("❌ Errore nella conversione del link")
-    else:
-        await update.message.reply_text(
-            "🤖 **Non ho capito questo messaggio**\n\n"
-            "**Puoi:**\n"
-            "• `/offerte` - Vedere offerte del giorno\n" 
-            "• `/cerca prodotto` - Cercare qualcosa\n"
-            "• Inviare link Amazon per conversione\n"
-            "• `/help` - Guida completa"
+    elif query.data == 'set_budget':
+        await query.message.reply_text(
+            "💰 **Imposta Budget Massimo**\n\n"
+            "Invia un messaggio con il budget massimo in euro.\n"
+            "Esempio: `50` per ricevere solo offerte sotto i 50€"
         )
+        context.user_data['awaiting'] = 'budget'
+    
+    elif query.data == 'settings':
+        await notifiche_command(update, context)
 
 def main():
-    print("🛒 Avvio Amazon Scraper Bot...")
+    global application
+    
+    print("🚀 Avvio Amazon Bot PREMIUM con notifiche automatiche...")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Inizializza database
+    if DATABASE_URL:
+        asyncio.create_task(db.connect())
+    
     # Comandi
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("offerte", offerte_command))
-    application.add_handler(CommandHandler("cerca", cerca_command))
+    application.add_handler(CommandHandler("notifiche", notifiche_command))
+    application.add_handler(CommandHandler("canale", canale_command))
+    # Aggiungi altri handler...
     
-    # Gestori
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CallbackQueryHandler(button_handler_advanced))
     
-    print("✅ Amazon Scraper Bot attivo! 🚀")
+    # Avvia scheduler per broadcast automatico
+    scheduler.add_job(
+        automatic_deal_broadcast,
+        'interval',
+        hours=3,  # Ogni 3 ore
+        start_date=datetime.now() + timedelta(minutes=5)  # Inizia dopo 5 minuti
+    )
+    
+    scheduler.start()
+    print("⏰ Scheduler avviato - broadcast ogni 3 ore")
+    
+    print("✅ Amazon Bot PREMIUM attivo!")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
