@@ -597,35 +597,76 @@ async def button_handler_advanced(update: Update, context: ContextTypes.DEFAULT_
     elif query.data == 'settings':
         await notifiche_command(update, context)
 
+        async def test_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando per testare il database"""
+    try:
+        if not db or not db.pool:
+            await update.message.reply_text("❌ Database non connesso")
+            return
+            
+        # Test inserimento utente
+        user = update.effective_user
+        await db.add_user(user.id, user.username, user.first_name)
+        
+        # Test lettura
+        async with db.pool.acquire() as conn:
+            result = await conn.fetchval(
+                'SELECT COUNT(*) FROM users WHERE user_id = $1', user.id
+            )
+            
+        await update.message.reply_text(
+            f"✅ **Database Test Riuscito!**\n\n"
+            f"👤 Utente salvato: {user.first_name}\n"
+            f"🔢 Record trovati: {result}\n"
+            f"📊 Database completamente funzionale!"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Errore Database**: {e}")
+
 def main():
     global application
     
-    print("🚀 Avvio Amazon Bot PREMIUM con notifiche automatiche...")
+    print("🚀 Avvio Amazon Bot PREMIUM con sistema completo...")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Inizializza database
-    if DATABASE_URL:
-        asyncio.create_task(db.connect())
+    # 👇 AGGIUNGI QUESTA PARTE ALL'INIZIO DELLA FUNZIONE main()
+    async def post_init(app):
+        """Inizializzazione post-avvio"""
+        print("🔍 Test connessione database...")
+        
+        # Test database prima di inizializzare tutto
+        if DATABASE_URL:
+            db_ok = await test_database_connection()
+            if db_ok:
+                print("✅ Database configurato correttamente")
+                # Connetti il database principale
+                await db.connect()
+            else:
+                print("❌ Database non disponibile - funzionalità limitate")
+        else:
+            print("⚠️ DATABASE_URL non configurato - modalità senza database")
+        
+        print("🎯 Bot inizializzato completamente")
     
-    # Comandi
+    # Assegna la funzione post_init
+    application.post_init = post_init
+    
+    # 👇 AGGIUNGI TUTTI GLI HANDLER DOPO post_init
+    # Comandi base
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("offerte", offerte_command))
+    application.add_handler(CommandHandler("cerca", cerca_command))
     application.add_handler(CommandHandler("notifiche", notifiche_command))
     application.add_handler(CommandHandler("canale", canale_command))
-    # Aggiungi altri handler...
     
+    # 👇 AGGIUNGI IL COMANDO DI TEST QUI
+    application.add_handler(CommandHandler("testdb", test_db_command))
+    
+    # Altri handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     application.add_handler(CallbackQueryHandler(button_handler_advanced))
-    
-    # Avvia scheduler per broadcast automatico
-    scheduler.add_job(
-        automatic_deal_broadcast,
-        'interval',
-        hours=3,  # Ogni 3 ore
-        start_date=datetime.now() + timedelta(minutes=5)  # Inizia dopo 5 minuti
-    )
-    
-    scheduler.start()
-    print("⏰ Scheduler avviato - broadcast ogni 3 ore")
     
     print("✅ Amazon Bot PREMIUM attivo!")
     application.run_polling(drop_pending_updates=True)
@@ -661,4 +702,5 @@ async def main():
         logger.error("Database non disponibile - alcune funzioni saranno limitate")
     
     # Continua con l'avvio normale...
+
 
