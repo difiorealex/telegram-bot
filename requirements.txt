@@ -1,22 +1,9 @@
-# Telegram Bot Framework
 python-telegram-bot==20.7
-
-# Web Scraping e HTTP
 aiohttp==3.9.1
 beautifulsoup4==4.12.2
 lxml==4.9.3
 requests==2.31.0
 fake-useragent==1.4.0
-
-# Database
 asyncpg==0.29.0
-sqlalchemy==2.0.23
-
-# Scheduling e Task
 APScheduler==3.10.4
-
-# Utilities
 python-dotenv==1.0.0
-
-# Async Support (spesso già incluso in Python 3.7+)
-asyncio==3.4.3
